@@ -172,11 +172,13 @@ static void ws_receive_cb(uint8_t *data, uint16_t len)
 /*配置为AP+STA模式*/
 void ap_wifi_apcfg(void)
 {
+    //仅进行一次初始化
     if (ap_started)
     {
         return;
     }
 
+    //进入ap+sta模式
     esp_err_t ret = wifi_manager_ap();
     if (ret != ESP_OK)
     {
@@ -184,12 +186,13 @@ void ap_wifi_apcfg(void)
         return;
     }
 
+    //websocket配置
     ws_cfg_t ws_cfg = 
     {
-        .html_code = html_code,
-        .receive_cb = ws_receive_cb,
+        .html_code = html_code,         //网页内容
+        .receive_cb = ws_receive_cb,    //websocket回调函数
     };                 
-    ret = web_server_start(&ws_cfg);
+    ret = web_server_start(&ws_cfg);    //进行websocket配置
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to start web server: %s", esp_err_to_name(ret));

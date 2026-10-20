@@ -14,7 +14,7 @@ static web_receive_cb receive_cb = NULL;
 static httpd_handle_t server_handle = NULL;
 
 /* 当前已建立WebSocket连接的客户端socket fd，用于向客户端发送数据 */
-static int client_fds = 0;
+static int client_fds = -1;
 
 /*
  * @brief 处理HTTP GET请求，返回网页HTML内容
@@ -27,7 +27,7 @@ static int client_fds = 0;
  */
 esp_err_t http_get_req(httpd_req_t *r)
 {
-    return httpd_resp_send(r, http_html, HTTPD_RESP_USE_STRLEN); // 发送网页内容给浏览器
+    return httpd_resp_send(r, http_html, HTTPD_RESP_USE_STRLEN);    // 发送保存的网页内容给浏览器(客户端)
 }
 
 /*
@@ -45,14 +45,14 @@ esp_err_t ws_get_req(httpd_req_t *r)
     if(r->method == HTTP_GET)
     {
         ESP_LOGI(TAG, "WebSocket handshake received");
-        client_fds = httpd_req_to_sockfd(r);                        // 保存当前客户端socket fd
+        client_fds = httpd_req_to_sockfd(r);                        // 获取当前客户端文件编号
         return ESP_OK;                                              // 握手成功，建立WebSocket连接
     }
 
     httpd_ws_frame_t ws_pkt;                                            // WebSocket数据包结构体
     esp_err_t ret;
-    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));                       // 初始化结构体
-    ret = httpd_ws_recv_frame(r, &ws_pkt, 0);                           // 先读取帧头信息，获取payload长度等参数
+    memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));                       // 清空结构体
+    ret = httpd_ws_recv_frame(r, &ws_pkt, 0);                           // max_len配置为0，获取payload长度等参数
     if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame info");
@@ -65,7 +65,7 @@ esp_err_t ws_get_req(httpd_req_t *r)
         return ESP_ERR_NO_MEM;
     }
 
-    ws_pkt.payload = buf;                                               // 设置payload指向缓冲区
+    ws_pkt.payload = buf;                                               // 设置pkt的数据缓冲区
     ret = httpd_ws_recv_frame(r, &ws_pkt, ws_pkt.len);                  // 实际读取数据载荷
     if (ret != ESP_OK)
     {
@@ -76,7 +76,7 @@ esp_err_t ws_get_req(httpd_req_t *r)
     buf[ws_pkt.len] = '\0';
     if (ret == ESP_OK)
     {
-        if(ws_pkt.type == HTTPD_WS_TYPE_TEXT)
+        if(ws_pkt.type == HTTPD_WS_TYPE_TEXT)                           //设置websocket帧类型为文本类型
         {
             if(receive_cb != NULL)
             {
@@ -103,10 +103,12 @@ esp_err_t ws_get_req(httpd_req_t *r)
  */
 esp_err_t web_server_start(ws_cfg_t *cfg)
 {
+    //保存指针
     if(cfg == NULL) return ESP_FAIL;
     http_html = cfg->html_code;                                         // 设置网页内容
     receive_cb = cfg->receive_cb;                                       // 设置消息接收回调
 
+    //初始化http协议
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();                     // 获取默认HTTPD配置
     esp_err_t ret = httpd_start(&server_handle, &config);               // 启动HTTPD服务
     if (ret != ESP_OK)
@@ -116,11 +118,12 @@ esp_err_t web_server_start(ws_cfg_t *cfg)
         return ret;
     }
 
+    //根目录下设置回调函数
     httpd_uri_t uri_http = {
-        .uri       = "/",                                             // 网页首页路径
-        .method    = HTTP_GET,                                         // 只允许GET请求
-        .handler   = http_get_req,                                     // 处理首页访问
-        .user_ctx  = NULL,
+        .uri       = "/",                                               // http的uri配置
+        .method    = HTTP_GET,                                          // 只允许GET请求方式
+        .handler   = http_get_req,                                      // http回调函数
+        .user_ctx  = NULL,                                              // 无传参
     };
     ret = httpd_register_uri_handler(server_handle, &uri_http);         // 注册网页访问处理函数
     if (ret != ESP_OK)
@@ -131,11 +134,12 @@ esp_err_t web_server_start(ws_cfg_t *cfg)
         return ret;
     }
 
+    // "/ws"目录下设置websocket回调函数
     httpd_uri_t uri_ws = {
-        .uri       = "/ws",                                           // WebSocket连接路径
+        .uri       = "/ws",                                             // WebSocket连接路径
         .method    = HTTP_GET,                                          // WebSocket建立时使用GET握手
         .handler   = ws_get_req,                                        // 处理WebSocket消息
-        .user_ctx  = NULL,
+        .user_ctx  = NULL,                                              // 无传参
         .is_websocket = true,                                           // 标记为WebSocket URI
     };
     ret = httpd_register_uri_handler(server_handle, &uri_ws);           // 注册WebSocket处理函数
@@ -191,5 +195,5 @@ esp_err_t web_server_send(uint8_t *data, uint16_t len)
     ws_pkt.len = len;                                                   // 设置数据长度
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;                                   // 设置为文本类型消息
     
-    return httpd_ws_send_frame_async(server_handle, client_fds, &ws_pkt);
+    return httpd_ws_send_frame_async(server_handle, client_fds, &ws_pkt);   //给client_fds客户端发送数据包
 }

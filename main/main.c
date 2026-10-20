@@ -37,13 +37,14 @@ void app_main(void)
     
     while (1)
     {
-
+        //KEY按键按下触发ap配网，iic未加互斥锁，会导致按键不稳定
         if(KEY1 == 0 && key1_released)
         {
             vTaskDelay(pdMS_TO_TICKS(20));
             if(KEY1 == 0)
             {
                 ESP_LOGI("MAIN", "KEY1 pressed, starting Wi-Fi AP");
+                
                 ap_wifi_apcfg();
                 key1_released = false;
             }
