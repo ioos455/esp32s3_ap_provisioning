@@ -17,7 +17,7 @@
 | 自建 WebSocket 服务器，JSON 双向通信 | ✅ 已完成 |
 | 提交 SSID / 密码后切换 STA 连接 | ✅ 已完成 |
 | LCD 显示连接状态与 IP | ✅ 已完成 |
-| 扫描周边 Wi-Fi 并推送列表到手机 | ⚠️ **有缺陷，见「已知问题」#2** |
+| 扫描周边 Wi-Fi 并推送列表到手机 | ✅ 已完成（失败/掉线均可恢复） |
 
 ---
 
@@ -135,7 +135,13 @@
 | `encrypted` | bool | `false` 表示开放网络（`WIFI_AUTH_OPEN`） |
 
 > 即使扫描到 0 个网络，设备也会回传 `{"wifi_list":[]}`，前端据此结束等待。
-> 但若 WebSocket 已断开（见「已知问题 #1」），该消息无法送达，前端会等到 20 秒超时。
+> 扫描失败时设备回传 `{"wifi_list":[],"error":"ESP_ERR_xxx"}`，前端直接提示失败原因；
+> 若推送时客户端恰好掉线，结果会缓存在设备上，客户端重连（或刷新页面）后立即补发。
+
+> ⚠️ **手机侧注意**：ESP32 热点没有外网，Android/iOS 检测到「无互联网」后可能自动切回移动数据，
+> 此时浏览器保留着已加载的页面，但 WebSocket 已经无法连到 `192.168.100.1`，表现为点了扫描没反应。
+> 解决：在 Wi-Fi 设置里选择「仍然保持连接 / 使用此网络」，并关闭「移动数据自动切换」（Android 的
+> “自动切换到移动数据” / iOS 的“无线局域网助理”）。
 
 ---
 
@@ -184,48 +190,35 @@ idf.py -p COMx flash monitor
 
 > 以下问题按严重程度排序，均已定位到具体代码位置。欢迎 PR。
 
-### 🔴 #1 WebSocket 连接建立后会自动断开
+### ✅ #1 WebSocket 一直连不上（已修复）
 
-**现象**：页面加载后 WebSocket 握手成功，但数秒后自动断开，前端反复显示「WebSocket连接断开，正在重连...」。
+**现象**：页面能正常打开，但 WebSocket 始终连不上（前端不停重连）；点击扫描没有任何反馈。
 
-**位置**：`components/BSP/SERVER/ws_server.c` 的 `ws_get_req()`
+**根因**：`HTTPD_DEFAULT_CONFIG()` 的 `max_req_hdr_len` 取自 `CONFIG_HTTPD_MAX_REQ_HDR_LEN`，本工程为 **512 字节**。
+普通 `GET /` 的请求头勉强能塞下，但浏览器发起 WebSocket 升级时还会附加
+`Upgrade` / `Origin` / `Sec-WebSocket-Key` / `Sec-WebSocket-Version` / `Sec-WebSocket-Extensions` 等字段，
+总长度必然超过 512，httpd 直接判定请求超长并丢弃 —— 握手请求根本不会派发到 `/ws` 的处理函数
+（开启 `DEBUG` 模块后访问 `/debug` 可以看到 `ws_handshakes` 始终为 0，而 HTTP 页面却访问正常）。
 
-**分析**：`httpd_config_t` 默认 `recv_wait_timeout = 5`（秒）。空闲时 `httpd_ws_recv_frame()` 会因接收超时返回错误，而当前实现把该错误直接 `return` 出去：
+**修复**：`web_server_start()` 中显式配置 `max_req_hdr_len = 1024`，
+并打开 `lru_purge_enable`（会话被浏览器 keep-alive 占满时回收最久未用的连接），
+同时把 httpd 栈从默认 4096 提到 6144。
 
-```c
-ret = httpd_ws_recv_frame(r, &ws_pkt, 0);
-if (ret != ESP_OK)
-{
-    ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame info");
-    return ret;                      // ← 返回非 ESP_OK，IDF 会关闭该连接
-}
-```
-
-IDF 的分发逻辑（`httpd_parse.c`）中：
-
-```c
-ret = sd->ws_handler(r);
-if (ret != ESP_OK) {
-    httpd_req_cleanup(r);            // 连接被清理
-}
-```
-
-**待办**：区分「接收超时」与其他错误，超时不应导致连接关闭；或延长 `recv_wait_timeout`。
+**原问题（已一并修掉）**：`ws_get_req()` 把 `httpd_ws_recv_frame()` 的所有错误都 `return` 给 httpd，
+而 IDF 的分发逻辑是「handler 返回非 `ESP_OK` 就关闭 socket」，读到半包/超时时整条连接会被关掉。
+现在失败只记日志并返回 `ESP_OK`，`web_server_send()` 发送前也会用 `httpd_ws_get_fd_info()` 校验连接。
 
 ---
 
-### 🔴 #2 Wi-Fi 扫描功能不可用
+### ✅ #2 Wi-Fi 扫描结果送不到前端（已修复）
 
-**现象**：点击「重新扫描Wi-Fi网络」后前端在 20 秒后提示「扫描Wi-Fi网络失败，请稍后重试」，始终不显示网络列表。
+**原问题**：扫描结果只推给全局保存的 `client_fds`。AP+STA 模式下扫描会让 SoftAP 短暂离开本信道，手机可能掉线或刷新页面，旧 fd 失效 → 结果丢失 → 前端等到 20 秒超时，表现为「扫描不到任何 Wi-Fi」。
 
-**位置**：`components/BSP/WIFISTA/ap_wifi.c` 的 `ws_receive_cb()` / `wifi_sacn_cb()`
-
-**分析**：扫描结果通过 `web_server_send()` → `httpd_ws_send_frame_async()` 推送给前端。若此时 WebSocket 已因 **#1** 断开，推送失败且前端收不到任何数据（`{"wifi_list":[]}` 也收不到），于是只能等前端 20 秒超时。
-
-**待办**：
-1. 先修复 #1；
-2. `wifi_sacn_cb()` 中增加对发送失败的处理，并考虑扫描失败时也回传明确错误信息；
-3. 在 `web_server_send()` 中增加连接有效性校验（见 #4）。
+**修复**：
+1. `ap_wifi.c` 用互斥锁缓存最近一次扫描 JSON，WebSocket 新建连接（含重连/刷新）时通过 `connect_cb` 立即补发；
+2. 扫描失败也回包 `{"wifi_list":[],"error":"ESP_ERR_xxx"}`，前端立即提示原因而不是空等；
+3. `wifi_scan_task()` 使用显式扫描配置：`show_hidden = true`、`home_chan_dwell_time = 120ms`（扫描过程中周期性回到 AP 信道，避免手机掉线）；
+4. 扫描返回 `ESP_ERR_WIFI_STATE`（STA 正在重连）时，先暂停重连再重试一次。
 
 ---
 
@@ -244,16 +237,16 @@ if (ret != ESP_OK) {
 **位置**：`components/BSP/SERVER/ws_server.c`
 
 ```c
-static int client_fds = 0;                              // 单变量
+static int client_fds = -1;                             // 单变量
 ...
 client_fds = httpd_req_to_sockfd(r);                    // 每次握手都覆盖
 ```
 
 **问题**：
-- 只记录最后一次握手的 socket fd。若同时存在多个连接（如刷新页面后旧连接未清理、或开多个标签页），数据会发到错误的 socket；
-- 未校验有效性：若握手尚未发生就调用 `web_server_send()`，会向 fd `0` 发送。
+- 只记录最后一次握手的 socket fd。若同时存在多个连接（如开多个标签页），数据只会发到最后握手的那一个；
+- ~~未校验有效性~~：已修复，`web_server_send()` 现在先用 `httpd_ws_get_fd_info()` 校验 fd 是否仍是有效 WebSocket，无效时返回 `ESP_ERR_INVALID_STATE`（上层会缓存结果并在下次连接时补发）。
 
-**待办**：改为数组 + 计数管理所有客户端；`web_server_send()` 增加 `server_handle != NULL && client_fds > 0` 校验；`web_server_stop()` 中清空 fd。
+**待办**：改为数组 + 计数管理所有客户端，实现多标签页同时刷新列表。
 
 ---
 
@@ -367,14 +360,63 @@ while (1)
 
 ---
 
+## 调试技巧（没有串口日志时）
+
+本项目 `LED0/LED1` 使用了 **GPIO43/44**，而这正是 UART0 控制台的 TX/RX 引脚，`led_init()` 执行后
+控制台会被 GPIO 复用覆盖，**运行时日志基本看不到**。为此固件预留了一个可选的诊断模块：
+
+```
+components/BSP/DEBUG/
+├── bsp_debug.c
+└── bsp_debug.h      # 开关 BSP_DEBUG_ENABLE，默认 0（禁用）
+```
+
+**默认是关闭的**：此时 `bsp_debug.c` 整个文件不参与编译，`ws_server.c` 里的
+`bsp_debug_ws_handshake()` / `bsp_debug_ws_frame()` / `bsp_debug_ws_send()` 都是头文件里的空内联函数，
+不注册 URI、不计数、不占 RAM（实测关闭时固件小约 1.4KB）。
+
+需要排查时，把 `bsp_debug.h` 里的默认值改成 1 重新编译：
+
+```c
+#ifndef BSP_DEBUG_ENABLE
+#define BSP_DEBUG_ENABLE 1      /* 1=启用 /debug 诊断页，0=禁用（默认） */
+#endif
+```
+
+然后访问：
+
+```
+http://192.168.100.1/debug
+```
+
+返回内容示例：
+
+```json
+{"reset_reason":1,"uptime_ms":73769,"free_heap":224852,"wifi_mode":3,
+ "sta_connected":false,"ws_fd":5,"ws_connected":true,
+ "ws_handshakes":1,"ws_frames":3,"ws_send_ok":3,"ws_send_fail":0}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `reset_reason` | 复位原因（1=POWERON，4/5=看门狗，6=PANIC） |
+| `uptime_ms` | 开机毫秒数，变小说明设备偷偷重启了 |
+| `wifi_mode` | 1=STA，2=AP，3=AP+STA |
+| `ws_handshakes` | WebSocket 握手成功次数；为 0 说明浏览器请求根本没到达设备 |
+| `ws_frames` / `ws_send_ok` / `ws_send_fail` | 收到的帧数、发送成功/失败次数 |
+
+> 该诊断页曾用于定位「页面能打开但 WebSocket 一直连不上」的问题：`ws_handshakes` 恒为 0，
+> 最终查出是 httpd 默认 `max_req_hdr_len=512` 装不下浏览器的 WS 升级请求头。
+
+---
+
 ## 后续改进方向
 
-1. 修复 #1 / #2，使扫描功能可用；
-2. 支持多 WebSocket 客户端（#4）；
-3. 为 I2C 增加并发保护（#9）；
-4. 增加配网超时退出机制（如 3 分钟无人连接则关闭 AP 以省电）；
-5. 增加配网失败回退（连不上目标网络时重新开放 AP，而非无限重连）；
-6. 将按键处理改为独立任务（#10）。
+1. 支持多 WebSocket 客户端（#4）；
+2. 为 I2C 增加并发保护（#9）；
+3. 增加配网超时退出机制（如 3 分钟无人连接则关闭 AP 以省电）；
+4. 增加配网失败回退（连不上目标网络时重新开放 AP，而非无限重连）；
+5. 将按键处理改为独立任务（#10）。
 
 ---
 

@@ -31,9 +31,21 @@ void wifi_event_handler(void* event_handler_arg, esp_event_base_t event_base,
         switch (event_id)
         {
             case WIFI_EVENT_STA_START:
-                spilcd_show_string(10, 120, 240, 16, 16, "Connecting...", RED);  /* 显示连接消息 */
-                esp_wifi_connect();  /* 连接到Wi-Fi网络 */
+            {
+                /* 没有配置SSID时不要盲目发起连接：失败重连会占用射频，
+                 * 导致后续 esp_wifi_scan_start() 返回 ESP_ERR_WIFI_STATE */
+                wifi_config_t sta_cfg;
+                if (esp_wifi_get_config(WIFI_IF_STA, &sta_cfg) == ESP_OK && sta_cfg.sta.ssid[0] != '\0')
+                {
+                    spilcd_show_string(10, 120, 240, 16, 16, "Connecting...", RED);  /* 显示连接消息 */
+                    esp_wifi_connect();  /* 连接到Wi-Fi网络 */
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "STA SSID not configured, skip auto connect");
+                }
                 break;
+            }
             case WIFI_EVENT_STA_DISCONNECTED:
                 spilcd_show_string(10, 120, 240, 16, 16, "Disconnected", RED);  /* 显示断开连接消息 */
                 //连接上限
@@ -152,7 +164,33 @@ void wifi_scan_task(void *pvParameters)
     wifi_mode_t mode;
     esp_wifi_get_mode(&mode);
     ESP_LOGI(TAG, "Starting Wi-Fi scan, mode=%d", mode);
-    esp_err_t ret = esp_wifi_scan_start(NULL, true);  /* 启动Wi-Fi扫描，阻塞直到扫描完成 */
+
+    /* AP+STA模式下扫描会让SoftAP离开本信道，若一直停留在扫描信道，手机侧会掉线。
+     * home_chan_dwell_time 让射频每隔一个信道回到AP所在信道一次，保证AP不会“消失”。 */
+    wifi_scan_config_t scan_cfg;
+    memset(&scan_cfg, 0, sizeof(scan_cfg));
+    scan_cfg.ssid = NULL;                                   /* 扫描全部SSID */
+    scan_cfg.bssid = NULL;
+    scan_cfg.channel = 0;                                   /* 0表示扫描所有信道 */
+    scan_cfg.show_hidden = true;                            /* 同时返回隐藏SSID的网络 */
+    scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan_cfg.scan_time.active.min = 60;
+    scan_cfg.scan_time.active.max = 150;
+    scan_cfg.home_chan_dwell_time = 120;
+
+    esp_err_t ret = esp_wifi_scan_start(&scan_cfg, true);  /* 启动Wi-Fi扫描，阻塞直到扫描完成 */
+    if (ret == ESP_ERR_WIFI_STATE)
+    {
+        /* STA正在重连时驱动不允许扫描，先停掉重连再重试一次 */
+        ESP_LOGW(TAG, "Wi-Fi is connecting, stop reconnecting and rescan");
+        int saved_connect_count = sta_connect_count;
+        sta_connect_count = 6;                              /* 阻止事件回调里再次发起重连 */
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(300));
+        ret = esp_wifi_scan_start(&scan_cfg, true);
+        sta_connect_count = saved_connect_count;            /* 恢复正常重连策略 */
+    }
+
     //启动扫描任务失败
     if (ret != ESP_OK)                                  /* 出错删除任务 */
     {
@@ -161,7 +199,7 @@ void wifi_scan_task(void *pvParameters)
         if (cb != NULL)
         {
             //存在就清除
-            cb(0, NULL);
+            cb(0, NULL, ret);
         }
         xSemaphoreGive(wifi_scan_semaphore);            /* 获取二值信号量 */
         vTaskDelete(NULL);
@@ -170,16 +208,20 @@ void wifi_scan_task(void *pvParameters)
 
     //获取WiFi数量，并分配内存
     uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);            /* 获取找到的接入点数量 */
+    ret = esp_wifi_scan_get_ap_num(&ap_count);      /* 获取找到的接入点数量 */
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to get Wi-Fi AP number: %s", esp_err_to_name(ret));
+    }
 
     wifi_ap_record_t *ap_records = ap_count > 0 ?
-        (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count) : NULL;  /* 为接入点记录分配内存 */
+        (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count) : NULL;  /* 为WiFi信息分配内存 */
     if (ap_count > 0 && ap_records == NULL) /* 出错删除任务 */
     {
         ESP_LOGE(TAG, "Failed to allocate memory for AP records");
         if (cb != NULL)
         {
-            cb(0, NULL);
+            cb(0, NULL, ESP_ERR_NO_MEM);
         }
         xSemaphoreGive(wifi_scan_semaphore);
         vTaskDelete(NULL);                          /* 删除任务并返回 */
@@ -190,7 +232,7 @@ void wifi_scan_task(void *pvParameters)
     //将获取到的WiFi保存在maclloc分配的内存
     if (ap_count > 0)
     {
-        ret = esp_wifi_scan_get_ap_records(&ap_count, ap_records);  /* 获取接入点记录 */
+        ret = esp_wifi_scan_get_ap_records(&ap_count, ap_records);  /* 获取WiFi信息 */
         if (ret != ESP_OK)
         {
             ESP_LOGE(TAG, "Failed to get Wi-Fi scan records: %s", esp_err_to_name(ret));
@@ -199,10 +241,10 @@ void wifi_scan_task(void *pvParameters)
     }
     if (cb != NULL)
     {
-        cb(ap_count, ap_records);               /* 调用回调函数，传入网络数量和接入点记录 */
+        cb((uint8_t)ap_count, ap_records, ret);     /* 调用回调函数，传入WiFi数量、WiFi信息和扫描结果 */
     }
 
-    free(ap_records);                           /* 释放为接入点记录分配的内存 */
+    free(ap_records);                           /* 释放为WiFi信息分配的内存 */
     xSemaphoreGive(wifi_scan_semaphore);        /* 如果信号量被获取，则将其归还 */
     vTaskDelete(NULL);                          /* 在完成后删除任务 */
 }

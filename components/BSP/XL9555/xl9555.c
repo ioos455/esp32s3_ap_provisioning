@@ -1,8 +1,22 @@
 #include "xl9555.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "esp_err.h"
 
 const char *xl9555_tag = "xl9555";
 i2c_master_dev_handle_t xl9555_handle = NULL;
 static uint16_t s_output_cache = 0;
+static SemaphoreHandle_t s_xl9555_mutex = NULL;
+
+/* 获取XL9555互斥量，只在首次调用时创建；创建失败返回NULL */
+static SemaphoreHandle_t xl9555_lock(void)
+{
+    if (s_xl9555_mutex == NULL)
+    {
+        s_xl9555_mutex = xSemaphoreCreateMutex();
+    }
+    return s_xl9555_mutex;
+}
 
 /**
  * @brief       读取XL9555的IO值
@@ -53,6 +67,16 @@ esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
  */
 uint16_t xl9555_pin_write(uint16_t pin, int val)
 {
+    SemaphoreHandle_t mutex = xl9555_lock();
+
+    if (mutex == NULL)
+    {
+        ESP_LOGE(xl9555_tag, "%s: mutex unavailable", __func__);
+        return s_output_cache;
+    }
+
+    xSemaphoreTake(mutex, portMAX_DELAY);
+
     if (val) {
         s_output_cache |= pin;
     } else {
@@ -64,7 +88,9 @@ uint16_t xl9555_pin_write(uint16_t pin, int val)
     w_data[1] = (s_output_cache >> 8) & 0xFF;
 
     xl9555_write_byte(XL9555_OUTPUT_PORT0_REG, w_data, 2);
-    
+
+    xSemaphoreGive(mutex);
+
     return s_output_cache;
 }
 
@@ -75,12 +101,31 @@ uint16_t xl9555_pin_write(uint16_t pin, int val)
  */
 int xl9555_pin_read(uint16_t pin)
 {
-    uint16_t ret;
-    uint8_t r_data[2];
+    uint16_t ret = 0;
+    uint8_t r_data[2] = {0};
+    SemaphoreHandle_t mutex = xl9555_lock();
 
-    xl9555_read_byte(r_data, 2);
+    if (mutex == NULL)
+    {
+        ESP_LOGE(xl9555_tag, "%s: mutex unavailable", __func__);
+        return 1;                                   /* 视为未按下，避免误触发配网 */
+    }
 
-    ret = r_data[1] << 8 | r_data[0];
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(20)) != pdTRUE)
+    {
+        return 1;                                   /* 读不到就当没按下，绝不返回随机值 */
+    }
+
+    esp_err_t err = xl9555_read_byte(r_data, 2);
+    xSemaphoreGive(mutex);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(xl9555_tag, "%s: read failed: %s", __func__, esp_err_to_name(err));
+        return 1;
+    }
+
+    ret = (uint16_t)((r_data[1] << 8) | r_data[0]);
 
     return (ret & pin) ? 1 : 0;
 }
@@ -188,6 +233,13 @@ esp_err_t xl9555_init(void)
     };
     /* I2C总线上添加XL9555设备 */
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &xl9555_i2c_dev_conf, &xl9555_handle));
+
+    /* 上电先创建互斥量，后续所有I2C访问复用同一把锁 */
+    if (xl9555_lock() == NULL)
+    {
+        ESP_LOGE(xl9555_tag, "Failed to create mutex");
+        return ESP_ERR_NO_MEM;
+    }
 
     /* 上电先读取一次清除中断标志 */
     xl9555_read_byte(r_data, 2);

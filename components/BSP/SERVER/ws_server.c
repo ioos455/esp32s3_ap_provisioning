@@ -1,4 +1,5 @@
 #include "ws_server.h"
+#include "bsp_debug.h"
 #include "esp_log.h"
 #include "esp_http_server.h"
 
@@ -10,11 +11,29 @@ static const char *http_html = NULL;
 /* WebSocket接收数据回调函数，收到消息后由外部模块处理 */
 static web_receive_cb receive_cb = NULL;
 
+/* WebSocket连接建立回调函数，客户端连上后由外部模块补发数据 */
+static web_connect_cb connect_cb = NULL;
+
 /* HTTPD服务实例句柄，唯一标识当前已启动的Web服务器 */
 static httpd_handle_t server_handle = NULL;
 
 /* 当前已建立WebSocket连接的客户端socket fd，用于向客户端发送数据 */
 static int client_fds = -1;
+
+/*
+ * @brief 判断保存的客户端fd是否仍是一个可用的WebSocket连接
+ *
+ * 手机刷新页面、切换Wi-Fi或扫描期间短暂掉线都会让旧fd失效，
+ * 发送前必须先校验，否则会往一个已关闭的socket写数据。
+ */
+static bool client_is_valid(void)
+{
+    if (server_handle == NULL || client_fds < 0)
+    {
+        return false;
+    }
+    return httpd_ws_get_fd_info(server_handle, client_fds) == HTTPD_WS_CLIENT_WEBSOCKET;
+}
 
 /*
  * @brief 处理HTTP GET请求，返回网页HTML内容
@@ -44,19 +63,27 @@ esp_err_t ws_get_req(httpd_req_t *r)
 {
     if(r->method == HTTP_GET)
     {
-        ESP_LOGI(TAG, "WebSocket handshake received");
         client_fds = httpd_req_to_sockfd(r);                        // 获取当前客户端文件编号
+        bsp_debug_ws_handshake();
+        ESP_LOGI(TAG, "WebSocket handshake received, fd=%d", client_fds);
+        if(connect_cb != NULL)
+        {
+            connect_cb();                                           // 通知上层：客户端已连上，可补发数据
+        }
         return ESP_OK;                                              // 握手成功，建立WebSocket连接
     }
 
+    bsp_debug_ws_frame();
     httpd_ws_frame_t ws_pkt;                                            // WebSocket数据包结构体
     esp_err_t ret;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));                       // 清空结构体
     ret = httpd_ws_recv_frame(r, &ws_pkt, 0);                           // max_len配置为0，获取payload长度等参数
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get frame info");
-        return ret;
+        /* 读到的是半包或读超时，此时直接把错误返回给httpd会导致整条连接被关闭，
+         * 因此这里只记录日志并返回ESP_OK，等下一帧再处理 */
+        ESP_LOGW(TAG, "httpd_ws_recv_frame failed to get frame info: %s", esp_err_to_name(ret));
+        return ESP_OK;
     }
     uint8_t *buf = (uint8_t *)malloc(ws_pkt.len + 1);                   // 分配接收缓冲区
     if (buf == NULL)
@@ -69,9 +96,9 @@ esp_err_t ws_get_req(httpd_req_t *r)
     ret = httpd_ws_recv_frame(r, &ws_pkt, ws_pkt.len);                  // 实际读取数据载荷
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG, "httpd_ws_recv_frame failed to get payload");
+        ESP_LOGW(TAG, "httpd_ws_recv_frame failed to get payload: %s", esp_err_to_name(ret));
         free(buf);
-        return ret;
+        return ESP_OK;                                                  // 同样不关闭连接
     }
     buf[ws_pkt.len] = '\0';
     if (ret == ESP_OK)
@@ -107,9 +134,17 @@ esp_err_t web_server_start(ws_cfg_t *cfg)
     if(cfg == NULL) return ESP_FAIL;
     http_html = cfg->html_code;                                         // 设置网页内容
     receive_cb = cfg->receive_cb;                                       // 设置消息接收回调
+    connect_cb = cfg->connect_cb;                                       // 设置连接建立回调
 
     //初始化http协议
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();                     // 获取默认HTTPD配置
+    /* 浏览器发起 WebSocket 升级时，请求头会带上 Upgrade/Origin/Sec-WebSocket-Key 等字段，
+     * 通常超过 sdkconfig 里的 CONFIG_HTTPD_MAX_REQ_HDR_LEN(默认512)，
+     * 导致握手请求被判定超长而直接丢弃（表现：HTTP 能访问，WebSocket 一直连不上）。 */
+    config.max_req_hdr_len = 1024;
+    /* 会话被浏览器 keep-alive 连接占满时，回收最久未使用的连接，避免新连接（WS）被拒绝 */
+    config.lru_purge_enable = true;
+    config.stack_size = 6144;                                            // 处理WS帧/JSON解析留足栈空间
     esp_err_t ret = httpd_start(&server_handle, &config);               // 启动HTTPD服务
     if (ret != ESP_OK)
     {
@@ -151,6 +186,9 @@ esp_err_t web_server_start(ws_cfg_t *cfg)
         return ret;
     }
 
+    // "/debug" 诊断页，仅在 BSP_DEBUG_ENABLE=1 时才会真正注册
+    bsp_debug_register_uri(server_handle);
+
     ESP_LOGI(TAG, "HTTP server started, WebSocket endpoint: /ws");
 
     return ESP_OK;
@@ -189,11 +227,46 @@ esp_err_t web_server_stop(void)
  */
 esp_err_t web_server_send(uint8_t *data, uint16_t len)
 {
+    if (data == NULL || len == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    //客户端可能已经在扫描期间掉线或刷新了页面，此时旧fd不可用，直接返回错误让上层缓存结果
+    if (!client_is_valid())
+    {
+        ESP_LOGW(TAG, "No WebSocket client available, %u bytes dropped", len);
+        bsp_debug_ws_send(false);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     httpd_ws_frame_t ws_pkt;
     memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));                       // 初始化WebSocket帧结构体
     ws_pkt.payload = data;                                              // 设置发送数据缓冲区
     ws_pkt.len = len;                                                   // 设置数据长度
     ws_pkt.type = HTTPD_WS_TYPE_TEXT;                                   // 设置为文本类型消息
-    
-    return httpd_ws_send_frame_async(server_handle, client_fds, &ws_pkt);   //给client_fds客户端发送数据包
+
+    esp_err_t ret = httpd_ws_send_frame_async(server_handle, client_fds, &ws_pkt);   //给client_fds客户端发送数据包
+    bsp_debug_ws_send(ret == ESP_OK);
+    return ret;
+}
+
+/*
+ * @brief 判断当前是否存在可用的WebSocket客户端
+ *
+ * @return true 有已建立且未断开的WebSocket客户端
+ */
+bool web_server_client_connected(void)
+{
+    return client_is_valid();
+}
+
+/*
+ * @brief 获取当前WebSocket客户端的socket fd
+ *
+ * @return 已连接的客户端fd，未连接时返回 -1
+ */
+int web_server_client_fd(void)
+{
+    return client_is_valid() ? client_fds : -1;
 }

@@ -8,8 +8,30 @@
 #include "wifista.h"
 #include "ap_wifi.h"    
 #include "esp_log.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
 #include <stdbool.h>
 #include <stdio.h>
+
+
+/* 复位原因，便于区分 崩溃/看门狗/欠压/上电 */
+static const char *reset_reason_str(esp_reset_reason_t reason)
+{
+    switch (reason)
+    {
+        case ESP_RST_POWERON:  return "POWERON";
+        case ESP_RST_EXT:      return "EXT_PIN";
+        case ESP_RST_SW:       return "SW(esp_restart)";
+        case ESP_RST_PANIC:    return "PANIC(abort/assert/crash)";
+        case ESP_RST_INT_WDT:  return "INT_WDT";
+        case ESP_RST_TASK_WDT: return "TASK_WDT";
+        case ESP_RST_WDT:      return "WDT";
+        case ESP_RST_DEEPSLEEP:return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT: return "BROWNOUT(供电)";
+        case ESP_RST_SDIO:     return "SDIO";
+        default:               return "UNKNOWN";
+    }
+}
 
 
 /**
@@ -20,6 +42,18 @@
 void app_main(void)
 {
     bool key1_released = true;
+
+    /* 必须先初始化NVS，否则Wi-Fi/PHY校准数据无法保存 */
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_ret);
+
+    ESP_LOGW("MAIN", "reset reason = %s, free heap = %u",
+             reset_reason_str(esp_reset_reason()), esp_get_free_heap_size());
 
     ESP_LOGI("MAIN", "Initializing LED");
     led_init();                 /* LED初始化 */
@@ -37,7 +71,7 @@ void app_main(void)
     
     while (1)
     {
-        //KEY按键按下触发ap配网，iic未加互斥锁，会导致按键不稳定
+        //KEY按键按下触发ap配网，iic加互斥锁
         if(KEY1 == 0 && key1_released)
         {
             vTaskDelay(pdMS_TO_TICKS(20));

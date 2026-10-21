@@ -166,6 +166,7 @@
 		var gateway = `ws://${window.location.hostname}/ws`;
         var websocket;
 		let scanTimeId;
+		let pendingScan = false;   //WS未就绪时的扫描请求，连上后自动补发
 		console.log('script run');
         window.addEventListener('load', onLoad);//		<--页面加载完毕,执行onLoad-->
 		
@@ -178,81 +179,102 @@
             websocket = new WebSocket(gateway);
             websocket.onopen = onOpen;
             websocket.onclose = onClose;
-            websocket.onerror = onError;
-            websocket.onmessage = onMessage; // <-- add this line
+            websocket.onmessage = onMessage;
         }
 		
 		function onOpen(event) {
             console.log('Connection opened');
-        showStatus('WebSocket已连接', 'success');
+            showStatus('已连接设备', 'success');
+            if (pendingScan) {
+                pendingScan = false;
+                scanNetwork('start');
+            }
         }
         function onClose(event) {
             console.log('Connection closed');
-            showStatus('WebSocket连接断开，正在重连...', 'error');
             document.getElementById('loading').style.display = 'none';
             document.getElementById('scan-btn').disabled = false;
-            setTimeout(initWebSocket, 3000);
-        }
-		function onError(event) {
-            console.error('WebSocket error', event);
-            showStatus('WebSocket连接失败，请确认已连接ESP32S3_AP', 'error');
-            document.getElementById('loading').style.display = 'none';
-            document.getElementById('scan-btn').disabled = false;
+            document.getElementById('scan-btn').textContent = '重新扫描Wi-Fi网络';
+            document.getElementById('submit-btn').disabled = false;
+            showStatus('与设备断开，正在重连...（请确认手机仍连接着 ESP32S3_AP 热点，并关闭"移动数据自动切换"）', 'error');
+            setTimeout(initWebSocket, 2000);
         }
         function onMessage(event) {
-            var state;
 			const data = JSON.parse(event.data);
             console.log(event.data);
 			const wifiListContainer = document.getElementById('wifi-list-container');
             const wifiList = document.getElementById('wifi-list');
             const btn = document.getElementById('scan-btn');
 			clearTimeout(scanTimeId);
-			document.getElementById('scan-btn').textContent = '重新扫描Wi-Fi网络';
+
+            //收到任何回包都先把界面从“扫描中”状态恢复
+            document.getElementById('scan-btn').textContent = '重新扫描Wi-Fi网络';
+            document.getElementById('loading').style.display = 'none';
+            btn.disabled = false;
+
+            if (data.error) {
+                showStatus('扫描失败：' + data.error, 'error');
+                return;
+            }
+
+            const list = data.wifi_list || [];
+            wifiList.innerHTML = '';
+            if (list.length === 0) {
+                wifiListContainer.classList.add('hidden');
+                showStatus('扫描完成，未发现Wi-Fi网络，请靠近路由器后重试', 'error');
+                return;
+            }
+
             wifiListContainer.classList.remove('hidden');
-			for (let i = 0; i < data.wifi_list.length; i++) {
-				console.log(`ssid: ${data.wifi_list[i].ssid}, rssi: ${data.wifi_list[i].rssi},encrypted: ${data.wifi_list[i].encrypted}`);
+			for (let i = 0; i < list.length; i++) {
+				console.log(`ssid: ${list[i].ssid}, rssi: ${list[i].rssi},encrypted: ${list[i].encrypted}`);
 				
 				const item = document.createElement('div');
 				item.className = 'wifi-item';
 				item.innerHTML = `
 					<div>
-						<strong>${data.wifi_list[i].ssid}</strong>
-						<span class="wifi-signal ${getSignalStrengthClass(data.wifi_list[i].rssi)}">
-							${getSignalStrengthIcon(data.wifi_list[i].rssi)} ${data.wifi_list[i].rssi}dBm
+						<strong>${list[i].ssid}</strong>
+						<span class="wifi-signal ${getSignalStrengthClass(list[i].rssi)}">
+							${getSignalStrengthIcon(list[i].rssi)} ${list[i].rssi}dBm
 						</span>
-						${data.wifi_list[i].encrypted ? '🔒' : '🌐'}
+						${list[i].encrypted ? '🔒' : '🌐'}
 					</div>
 				`;
 				
 				item.addEventListener('click', () => {
-					document.getElementById('ssid').value = data.wifi_list[i].ssid;
+					document.getElementById('ssid').value = list[i].ssid;
 					document.getElementById('password').focus();
 				});
 				
 				wifiList.appendChild(item);
 			}
-            document.getElementById('loading').style.display = 'none';
-            btn.disabled = false;
             showStatus('扫描完成','success');
         }
 		
         // 扫描Wi-Fi网络
         document.getElementById('scan-btn').addEventListener('click', function() {
             const btn = this;
-            const wifiListContainer = document.getElementById('wifi-list-container');
             const wifiList = document.getElementById('wifi-list');
-            
+
             btn.disabled = true;
             btn.textContent = '正在扫描...';
             document.getElementById('loading-text').textContent = '正在扫描Wi-Fi网络...';
             document.getElementById('loading').style.display = 'block';
             wifiList.innerHTML = '';
+
+            if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+                //设备暂时没连上，等WS就绪后自动发起扫描
+                pendingScan = true;
+                showStatus('正在连接设备...若一直无响应，请确认手机没有被切回移动数据', 'error');
+                return;
+            }
+
 			scanNetwork('start');
 			scanTimeId = setTimeout(() => {
 				btn.textContent = '重新扫描Wi-Fi网络';
                 btn.disabled = false;
                 document.getElementById('loading').style.display = 'none';
-                showStatus('扫描Wi-Fi网络失败，请稍后重试', 'error');
+                showStatus('扫描Wi-Fi网络超时，请重试', 'error');
                 }, 20*1000);
         });
         
@@ -276,6 +298,12 @@
         
         // 模拟配置网络
         function configureNetwork(ssid, password) {
+			if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+				showStatus('WebSocket未连接，请等待重连后再试', 'error');
+				document.getElementById('loading').style.display = 'none';
+				document.getElementById('submit-btn').disabled = false;
+				return;
+			}
 			const manualJson = '{"ssid":"' + ssid+ '","password":"' + password + '"}';
 			websocket.send(manualJson);
 			showStatus('开始配置网络！请留意设备信息...','success');
@@ -283,14 +311,12 @@
         
         // 开始扫描
         function scanNetwork(msg) {
+			if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+				pendingScan = true;
+				return;
+			}
 			const manualJson = '{"scan":"' + msg+ '"}';
-            if (!websocket || websocket.readyState !== WebSocket.OPEN) {
-                showStatus('WebSocket尚未连接，请刷新页面后重试', 'error');
-                document.getElementById('loading').style.display = 'none';
-                document.getElementById('scan-btn').disabled = false;
-                return;
-            }
-            websocket.send(manualJson);
+			websocket.send(manualJson);
 			showStatus('开始扫描....','success');
         } 
 

@@ -1,6 +1,7 @@
 set(src_dirs
             HTML
             SERVER
+            DEBUG
             WIFISTA
             LED
             MYIIC
@@ -11,6 +12,7 @@ set(src_dirs
 set(include_dirs
             HTML
             SERVER
+            DEBUG
             WIFISTA
             LED
             MYIIC

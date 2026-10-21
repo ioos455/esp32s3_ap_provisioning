@@ -405,6 +405,7 @@ void spilcd_show_char(uint16_t x, uint16_t y, uint8_t chr, uint8_t size, uint8_t
     if (NULL == pcolor)
     {
         ESP_LOGE("TAG", "Memory for bitmap is not enough");
+        return;                 /* 申请失败必须返回，否则下面 pcolor[...] 会写空指针导致重启 */
     }
 
     ch_offset = chr - ' ';    /* 得到偏移后的值（ASCII字库是从空格开始取模，所以-' '就是对应字符的字库） */

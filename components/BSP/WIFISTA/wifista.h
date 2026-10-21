@@ -13,8 +13,13 @@
 #define DEFAULT_WIFI_AP_PASSWORD    WIFI_SECRET_AP_PASSWORD
 
 
-//扫描WIFI回调函数
-typedef void (*p_wifi_scan_cb)(uint8_t num_networks, wifi_ap_record_t *ap_records);
+/*
+ * @brief 扫描回调函数
+ * @param num_networks WiFi数量
+ * @param *ap_records WiFi信息
+ * @param result 扫描结果，ESP_OK表示扫描成功（此时列表可能为空）
+*/
+typedef void (*p_wifi_scan_cb)(uint8_t num_networks, wifi_ap_record_t *ap_records, esp_err_t result);
 
 /*
  * @brief 初始化Wi-Fi站点模式
