@@ -18,6 +18,19 @@
 | 提交 SSID / 密码后切换 STA 连接 | ✅ 已完成 |
 | LCD 显示连接状态与 IP | ✅ 已完成 |
 | 扫描周边 Wi-Fi 并推送列表到手机 | ✅ 已完成（失败/掉线均可恢复） |
+| `/debug` 运行时诊断页 | ✅ 已实现，**默认关闭**（见「调试技巧」） |
+
+---
+
+## 更新记录
+
+### v1.1（2026-10）
+
+| 变更 | 说明 |
+| --- | --- |
+| 🤖 **AI 辅助修复「扫描不到 Wi-Fi」** | 页面能打开，但 WebSocket 始终连不上，点扫描毫无结果。根因是 httpd 默认 `max_req_hdr_len = 512` 装不下浏览器的 WS 升级请求头（`Origin` / `Sec-WebSocket-*` 等），握手请求被直接丢弃，`/ws` 处理函数一次都没被调用。修复后 WS 正常握手，扫描结果可下发（详见「已知问题」#1 / #2）。 |
+| 🔒 **新增 I2C（按键）互斥锁** | XL9555 的按键读取与 LCD 控制都走 I2C，现统一由 `s_xl9555_mutex` 串行化访问，避免主循环读按键时与其它任务抢占总线导致数据错乱；`xl9555_pin_read()` 取锁超时（20 ms）按「未按下」处理，绝不误触发配网。 |
+| 🩺 **新增 debug 诊断功能（默认关闭）** | 板载 LED0/LED1 与串口控制台**共用 GPIO43/44**，`led_init()` 之后运行日志基本不可见。为此新增 `components/BSP/DEBUG` 模块，通过 `/debug` 页面输出复位原因、运行时长、堆、Wi-Fi 模式、WS 握手/收发计数；开关 `BSP_DEBUG_ENABLE` **默认为 0（关闭）**，关闭时不注册页面、不统计、不占 RAM。 |
 
 ---
 
@@ -27,8 +40,11 @@
 | --- | --- | --- |
 | SPI LCD | SPI | 见 `components/BSP/MYSPI`、`SPILCD` |
 | XL9555 扩展 IO（按键 / LCD 控制） | I2C0 | SDA=GPIO38, SCL=GPIO48 |
-| LED0 / LED1 | GPIO | GPIO43 / GPIO44 |
+| LED0 / LED1 | GPIO | GPIO43 / GPIO44 ⚠️ 与 UART0 控制台 TX/RX 复用 |
 | 按键 KEY1（触发配网） | XL9555 P1.4 | 经 I2C 读取 |
+
+> ⚠️ **GPIO43/44 冲突**：这两个脚同时是 UART0 的控制台 TX/RX。`led_init()` 把它们配成 GPIO 后，
+> 串口就看不到运行时日志了（只剩启动阶段那几行），调试请使用 `/debug`（见「调试技巧」）。
 
 配网热点：`SSID = ESP32S3_AP`，设备 IP = `192.168.100.1`
 
@@ -47,6 +63,8 @@
 │       │   └── apcfg.html          # 配网页面（含前端 WebSocket 逻辑）
 │       ├── SERVER/
 │       │   ├── ws_server.c/.h      # HTTP + WebSocket 服务器
+│       ├── DEBUG/
+│       │   ├── bsp_debug.c/.h      # /debug 诊断页（BSP_DEBUG_ENABLE 默认 0=关闭）
 │       ├── WIFISTA/
 │       │   ├── wifista.c/.h        # Wi-Fi STA 模式、扫描任务
 │       │   ├── ap_wifi.c/.h        # 配网流程、SPIFFS、JSON 收发
@@ -319,13 +337,16 @@ if(root)
 
 ---
 
-### 🟡 #9 I2C 总线缺少互斥保护
+### ✅ #9 I2C 总线缺少互斥保护（已修复）
 
-**位置**：`components/BSP/MYIIC/myiic.c`
+**位置**：`components/BSP/XL9555/xl9555.c`
 
-**问题**：`xl9555.c` 通过该总线读 IO，若后续有多个任务同时访问 I2C（如新增传感器读取），会出现总线数据错乱（I2C 非线程安全）。当前单一访问路径下暂未暴露。
+**原问题**：`xl9555.c` 通过 I2C 读 IO，若多个任务同时访问（按键轮询 + LCD 控制），I2C 非线程安全，会出现总线数据错乱。
 
-**待办**：为 I2C 访问增加互斥锁（`xSemaphoreCreateMutex`），或统一由单个任务发起所有 I2C 事务。
+**已处理**：`xl9555_init()` 中创建 `s_xl9555_mutex`，`xl9555_pin_read()` / `xl9555_pin_write()` 全部在锁内完成；
+读按键使用 20 ms 超时，取锁失败或读取失败一律返回「未按下」，避免总线异常时误触发配网。
+
+**待办**：若后续新增独立 I2C 传感器，建议把锁上移到 `myiic.c` 统一管理总线。
 
 ---
 
@@ -352,11 +373,12 @@ while (1)
 | 位置 | 问题 |
 | --- | --- |
 | `ap_wifi.c` | `if (buffer == NULL)` 后缺少大括号，可读性差 |
-| `wifista.c` | `esp_wifi_scan_get_ap_num()` 返回值未检查 |
 | `wifista.c` | IP 事件回调中对 `event_data` 直接按 `esp_netif_ip_info_t*` 强转，未校验事件类型 |
 | `ws_server.c` | `web_server_send()` 的 `len` 参数为 `uint16_t`，而 `strlen()` 返回 `size_t`，超长数据会被截断 |
-| `main.c` | `nvs_flash_init()` 失败时未处理（如 NVS 分区满或版本不匹配应擦除重试） |
 | 全局 | 部分文件缺少统一日志 TAG，排查问题时难以区分来源 |
+
+> 已修复并移除：`esp_wifi_scan_get_ap_num()` 返回值未检查（现已在 `wifi_scan_task()` 中判断并打印错误）、
+> `nvs_flash_init()` 失败未处理（`main.c` 已对 `NO_FREE_PAGES` / `NEW_VERSION_FOUND` 做擦除重试）。
 
 ---
 
@@ -413,10 +435,10 @@ http://192.168.100.1/debug
 ## 后续改进方向
 
 1. 支持多 WebSocket 客户端（#4）；
-2. 为 I2C 增加并发保护（#9）；
-3. 增加配网超时退出机制（如 3 分钟无人连接则关闭 AP 以省电）；
-4. 增加配网失败回退（连不上目标网络时重新开放 AP，而非无限重连）；
-5. 将按键处理改为独立任务（#10）。
+2. 增加配网超时退出机制（如 3 分钟无人连接则关闭 AP 以省电）；
+3. 增加配网失败回退（连不上目标网络时重新开放 AP，而非无限重连）；
+4. 将按键处理改为独立任务（#10）；
+5. 解决 LED 与串口控制台共用 GPIO43/44 的硬件冲突（换脚，或改用 USB-Serial-JTAG 输出日志）。
 
 ---
 
